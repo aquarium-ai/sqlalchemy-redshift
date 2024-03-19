@@ -720,18 +720,68 @@ class RedshiftDialectMixin(DefaultDialect):
         :meth:`~sqlalchemy.engine.interfaces.Dialect.get_columns`.
         """
         cols = self._get_redshift_columns(connection, table_name, schema, **kw)
-        if not self._domains:
-            self._domains = self._load_domains(connection)
+        # if not self._domains:
+        #     self._domains = self._load_domains(connection)
         domains = self._domains
         columns = []
         for col in cols:
             column_info = self._get_column_info(
-                name=col.name, format_type=col.format_type,
-                default=col.default, notnull=col.notnull, domains=domains,
-                enums=[], schema=col.schema, encode=col.encode,
-                comment=col.comment)
+                name=col.name, type_=col.format_type,
+                default=col.default, nullable=not col.notnull, encode=col.encode)
             columns.append(column_info)
         return columns
+
+    def _default_multi_reflect(
+        self,
+        single_tbl_method,
+        connection,
+        kind,
+        schema,
+        filter_names,
+        scope,
+        **kw,
+    ):
+        if len(filter_names) != 1:
+            raise Exception("Not Implemented")
+
+        result = single_tbl_method(connection, filter_names[0], schema, **kw)
+        return {(schema, filter_names[0]): result}
+
+    def get_multi_table_options(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_table_options, connection, **kw
+        )
+
+    def get_multi_columns(self, connection, **kw):
+        result = self._default_multi_reflect(self.get_columns, connection, **kw)
+        return result
+
+    def get_multi_pk_constraint(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_pk_constraint, connection, **kw
+        )
+
+    def get_multi_foreign_keys(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_foreign_keys, connection, **kw
+        )
+
+    def get_multi_indexes(self, connection, **kw):
+        return self._default_multi_reflect(self.get_indexes, connection, **kw)
+
+    def get_multi_unique_constraints(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_unique_constraints, connection, **kw
+        )
+
+    def get_multi_check_constraints(self, connection, **kw):
+        return self._default_multi_reflect(
+            self.get_check_constraints, connection, **kw
+        )
+
+    def get_multi_table_comment(self, connection, schema, filter_names, **kw):
+        return {}
+
 
     @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kw):
@@ -980,6 +1030,99 @@ class RedshiftDialectMixin(DefaultDialect):
                 relation_names.append(key.name)
         return relation_names
 
+    def _resolve_type_affinity(self, type_):
+        """Return a data type from a reflected column, using affinity rules.
+
+        SQLite's goal for universal compatibility introduces some complexity
+        during reflection, as a column's defined type might not actually be a
+        type that SQLite understands - or indeed, my not be defined *at all*.
+        Internally, SQLite handles this with a 'data type affinity' for each
+        column definition, mapping to one of 'TEXT', 'NUMERIC', 'INTEGER',
+        'REAL', or 'NONE' (raw bits). The algorithm that determines this is
+        listed in https://www.sqlite.org/datatype3.html section 2.1.
+
+        This method allows SQLAlchemy to support that algorithm, while still
+        providing access to smarter reflection utilities by recognizing
+        column definitions that SQLite only supports through affinity (like
+        DATE and DOUBLE).
+
+        """
+        match = re.match(r"([\w ]+)(\(.*?\))?", type_)
+        if match:
+            coltype = match.group(1)
+            args = match.group(2)
+        else:
+            coltype = ""
+            args = ""
+
+        if coltype in self.ischema_names:
+            coltype = self.ischema_names[coltype]
+        elif "INT" in coltype:
+            coltype = sqltypes.INTEGER
+        elif "CHAR" in coltype or "CLOB" in coltype or "TEXT" in coltype:
+            coltype = sqltypes.TEXT
+        elif "BLOB" in coltype or not coltype:
+            coltype = sqltypes.NullType
+        elif "REAL" in coltype or "FLOA" in coltype or "DOUB" in coltype:
+            coltype = sqltypes.REAL
+        else:
+            coltype = sqltypes.NUMERIC
+
+        if args is not None:
+            args = re.findall(r"(\d+)", args)
+            try:
+                coltype = coltype(*[int(a) for a in args])
+            except TypeError:
+                util.warn(
+                    "Could not instantiate type %s with "
+                    "reflected arguments %s; using no arguments."
+                    % (coltype, args)
+                )
+                coltype = coltype()
+        else:
+            coltype = coltype()
+
+        return coltype
+
+    def _super_get_column_info(
+        self,
+        name,
+        type_,
+        nullable,
+        default,
+        # primary_key,
+        generated,
+        # persisted,
+        # tablesql,
+    ):
+        if generated:
+            # the type of a column "cc INTEGER GENERATED ALWAYS AS (1 + 42)"
+            # somehow is "INTEGER GENERATED ALWAYS"
+            type_ = re.sub("generated", "", type_, flags=re.IGNORECASE)
+            type_ = re.sub("always", "", type_, flags=re.IGNORECASE).strip()
+        coltype = self._resolve_type_affinity(type_)
+        if default is not None:
+            default = str(default)
+        colspec = {
+            "name": name,
+            "type": coltype,
+            "nullable": nullable,
+            "default": default,
+            "autoincrement": "auto",
+            # "primary_key": primary_key,
+        }
+        if generated:
+            sqltext = ""
+            # if tablesql:
+            #     pattern = r"[^,]*\s+AS\s+\(([^,]*)\)\s*(?:virtual|stored)?"
+            #     match = re.search(
+            #         re.escape(name) + pattern, tablesql, re.IGNORECASE
+            #     )
+            #     if match:
+            #         sqltext = match.group(1)
+            colspec["computed"] = {"sqltext": sqltext}
+        return colspec
+
     def _get_column_info(self, *args, **kwargs):
         kw = kwargs.copy()
         encode = kw.pop('encode', None)
@@ -990,10 +1133,10 @@ class RedshiftDialectMixin(DefaultDialect):
 
         if sa_version < Version('1.4.0') and 'identity' in kw:
             del kw['identity']
-        elif sa_version >= Version('1.4.0') and 'identity' not in kw:
-            kw['identity'] = None
+        # elif sa_version >= Version('1.4.0') and 'identity' not in kw:
+        #     kw['identity'] = None
 
-        column_info = super(RedshiftDialectMixin, self)._get_column_info(
+        column_info = self._super_get_column_info(
             *args,
             **kw
         )
@@ -1032,6 +1175,7 @@ class RedshiftDialectMixin(DefaultDialect):
         key = RelationKey(table_name, schema, connection)
         if key not in all_schema_columns.keys():
             key = key.unquoted()
+
         return all_schema_columns[key]
 
     def _get_redshift_constraints(self, connection, table_name,
@@ -1370,7 +1514,7 @@ class RedshiftDialect_redshift_connector(RedshiftDialectMixin, PGDialect):
         def on_connect(conn):
             from sqlalchemy import util
             from sqlalchemy.sql.elements import quoted_name
-            conn.py_types[quoted_name] = conn.py_types[util.text_type]
+            # conn.py_types[quoted_name] = conn.py_types[util.text_type]
 
         fns.append(on_connect)
 
